@@ -347,7 +347,7 @@ namespace UpDownSplit
                 int i = 0;
                 foreach (KeyValuePair<string, string> kv in Values)
                     lines[i++] = kv.Key + "=" + kv.Value;
-                File.WriteAllLines(FilePath, lines, Encoding.UTF8);
+                File.WriteAllLines(FilePath, lines, new UTF8Encoding(false));
             }
             catch { } // 配置写不进去不影响分屏功能
         }
@@ -698,13 +698,21 @@ namespace UpDownSplit
             RefreshWindows();
             UpdateRatioUi();
 
-            // 关窗时记住每块屏的布局和比例，下次打开自动填入
+            // 关窗时记住每块屏的布局、比例和所选窗口，下次打开自动填入
             FormClosed += delegate
             {
                 foreach (ScreenCard c in _cards)
                 {
-                    Config.Set(MonitorKey(c.Screen) + "|layout", c.Layout.SelectedIndex.ToString());
-                    Config.Set(MonitorKey(c.Screen) + "|ratio", c.Ratio.Value.ToString());
+                    string key = MonitorKey(c.Screen);
+                    Config.Set(key + "|layout", c.Layout.SelectedIndex.ToString());
+                    Config.Set(key + "|ratio", c.Ratio.Value.ToString());
+                    for (int zi = 0; zi < c.Zones.Length; zi++)
+                    {
+                        WindowInfo wi = c.Zones[zi].SelectedItem as WindowInfo;
+                        bool has = wi != null && wi.Handle != IntPtr.Zero;
+                        Config.Set(key + "|z" + (zi + 1) + "proc", has ? wi.ProcessName : "");
+                        Config.Set(key + "|z" + (zi + 1) + "title", has ? wi.Title : "");
+                    }
                 }
                 Config.Save();
             };
@@ -823,11 +831,20 @@ namespace UpDownSplit
             _windows = Native.ListWindows();
             foreach (ScreenCard c in _cards)
             {
-                foreach (ComboBox combo in c.Zones)
+                string key = MonitorKey(c.Screen);
+                for (int zi = 0; zi < c.Zones.Length; zi++)
                 {
+                    ComboBox combo = c.Zones[zi];
                     IntPtr keep = IntPtr.Zero;
                     WindowInfo sel = combo.SelectedItem as WindowInfo;
                     if (sel != null) keep = sel.Handle;
+                    // 没有现成选中时，按上次记住的 进程名+标题 找回窗口
+                    string wantProc = "", wantTitle = "";
+                    if (keep == IntPtr.Zero)
+                    {
+                        wantProc = Config.Get(key + "|z" + (zi + 1) + "proc", "");
+                        wantTitle = Config.Get(key + "|z" + (zi + 1) + "title", "");
+                    }
                     combo.Items.Clear();
                     combo.Items.Add(WindowInfo.None);
                     foreach (WindowInfo w in _windows)
@@ -837,10 +854,27 @@ namespace UpDownSplit
                     if (keep != IntPtr.Zero)
                         for (int i = 1; i < combo.Items.Count; i++)
                             if (((WindowInfo)combo.Items[i]).Handle == keep) { found = i; break; }
+                    if (found == 0 && wantProc.Length > 0)
+                        found = FindSaved(combo, wantProc, wantTitle);
                     combo.SelectedIndex = found;
                 }
             }
             _winCount.Text = string.Format("检测到 {0} 个可摆放的窗口，{1} 块显示器", _windows.Count, _cards.Count);
+        }
+
+        // 找回上次选的窗口：先精确匹配 进程名+标题；找不到且该进程只有一个候选窗口时按进程匹配
+        private static int FindSaved(ComboBox combo, string proc, string title)
+        {
+            int byProcess = 0, hits = 0;
+            for (int i = 1; i < combo.Items.Count; i++)
+            {
+                WindowInfo w = (WindowInfo)combo.Items[i];
+                if (w.ProcessName != proc) continue;
+                if (w.Title == title) return i;
+                byProcess = i;
+                hits++;
+            }
+            return hits == 1 ? byProcess : 0;
         }
 
         private void UpdateRatioUi()
