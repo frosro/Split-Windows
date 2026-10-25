@@ -1,3 +1,4 @@
 UpDownSplit.exe
 *.pdb
 *.cache
+.zcode/

@@ -1,9 +1,21 @@
 @echo off
-rem ç¼–è¯‘"ä¸Šä¸‹åˆ†å±åŠ©æ‰‹"ï¼ˆä½¿ç”¨ Windows è‡ªå¸¦çš„ .NET Framework ç¼–è¯‘å™¨ï¼Œæ— éœ€å®‰è£…ä»»ä½•ä¸œè¥¿ï¼‰
+rem ±àÒë"ÉÏÏÂ·ÖÆÁÖúÊÖ"£¨Ê¹ÓÃ Windows ×Ô´øµÄ .NET Framework ±àÒëÆ÷£¬ÎŞĞè°²×°ÈÎºÎ¶«Î÷£©
+rem ×Ô¶¯Ì½²â csc.exe£ºÏÈ Framework64 ÔÙ Framework£¬È¡°æ±¾ºÅ×î¸ßµÄ
+setlocal
 cd /d "%~dp0"
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /codepage:65001 /win32icon:app.ico /out:UpDownSplit.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll UpDownSplit.cs
-if errorlevel 1 (
-    echo ç¼–è¯‘å¤±è´¥
+set "CSC="
+for %%D in ("%WINDIR%\Microsoft.NET\Framework64" "%WINDIR%\Microsoft.NET\Framework") do (
+    for /f "delims=" %%F in ('dir /b /ad "%%~D\v4*" 2^>nul') do (
+        if exist "%%~D\%%F\csc.exe" set "CSC=%%~D\%%F\csc.exe"
+    )
+)
+if not defined CSC (
+    echo Î´ÕÒµ½ .NET Framework ±àÒëÆ÷ csc.exe
     exit /b 1
 )
-echo ç¼–è¯‘å®Œæˆ: %~dp0UpDownSplit.exe
+"%CSC%" /nologo /target:winexe /codepage:65001 /win32icon:app.ico /out:UpDownSplit.exe /r:System.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll UpDownSplit.cs
+if errorlevel 1 (
+    echo ±àÒëÊ§°Ü
+    exit /b 1
+)
+echo ±àÒëÍê³É: %~dp0UpDownSplit.exe

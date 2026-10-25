@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -35,6 +36,16 @@ namespace UpDownSplit
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                try
+                {
+                    MessageBox.Show("发生错误：" + e.Exception.Message, "上下分屏助手",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+                catch { }
+            };
             using (TrayApp app = new TrayApp())
             {
                 Application.Run(app);
@@ -67,11 +78,11 @@ namespace UpDownSplit
             switch (args[0].TrimStart('-', '/').ToLowerInvariant())
             {
                 case "top":
-                    if (args.Length > 1) { IntPtr h = ParseHwnd(args[1]); if (h != IntPtr.Zero) { mover.Place(h, Half.Top); return 0; } }
-                    mover.PlaceForeground(Half.Top); return 0;
+                    if (args.Length > 1) { IntPtr h = ParseHwnd(args[1]); if (h != IntPtr.Zero) return mover.Place(h, Half.Top) ? 0 : 1; }
+                    return mover.PlaceForeground(Half.Top) ? 0 : 1;
                 case "bottom":
-                    if (args.Length > 1) { IntPtr h = ParseHwnd(args[1]); if (h != IntPtr.Zero) { mover.Place(h, Half.Bottom); return 0; } }
-                    mover.PlaceForeground(Half.Bottom); return 0;
+                    if (args.Length > 1) { IntPtr h = ParseHwnd(args[1]); if (h != IntPtr.Zero) return mover.Place(h, Half.Bottom) ? 0 : 1; }
+                    return mover.PlaceForeground(Half.Bottom) ? 0 : 1;
                 case "split":
                 {
                     if (args.Length > 1)
@@ -82,14 +93,12 @@ namespace UpDownSplit
                             if (args.Length > 2)
                             {
                                 IntPtr b = ParseHwnd(args[2]);
-                                if (b != IntPtr.Zero) { mover.SplitWindows(a, b); return 0; }
+                                if (b != IntPtr.Zero) return mover.SplitWindows(a, b) ? 0 : 1;
                             }
-                            mover.SplitWindow(a);
-                            return 0;
+                            return mover.SplitWindow(a) ? 0 : 1;
                         }
                     }
-                    mover.SplitTopBottom();
-                    return 0;
+                    return mover.SplitTopBottom() ? 0 : 1;
                 }
                 case "restore":
                     mover.RestoreLast(); return 0;
@@ -98,15 +107,14 @@ namespace UpDownSplit
                     Native.RECT r;
                     IntPtr h = args.Length > 1 ? ParseHwnd(args[1]) : IntPtr.Zero;
                     if (h == IntPtr.Zero || !ParseRect(args, 2, out r)) return 1;
-                    mover.Place(h, r);
-                    return 0;
+                    return mover.Place(h, r) ? 0 : 1;
                 }
                 case "testundo": // 摆位后立即还原，用于验证 undo 逻辑
                 {
                     Native.RECT r;
                     IntPtr h = args.Length > 1 ? ParseHwnd(args[1]) : IntPtr.Zero;
                     if (h == IntPtr.Zero || !ParseRect(args, 2, out r)) return 1;
-                    mover.Place(h, r);
+                    if (!mover.Place(h, r)) return 1;
                     mover.RestoreLast();
                     return 0;
                 }
@@ -117,8 +125,8 @@ namespace UpDownSplit
                     foreach (WindowInfo w in Native.ListWindows())
                         sb.Append(w.Handle.ToInt64()).Append('|').Append(w.ProcessName).Append('|')
                           .Append(w.Title).Append('\n');
-                    try { System.IO.File.WriteAllText(args[1], sb.ToString(), Encoding.UTF8); return 0; }
-                    catch { return 1; }
+                    try { File.WriteAllText(args[1], sb.ToString(), Encoding.UTF8); return 0; }
+                    catch (Exception ex) { Console.Error.WriteLine("listwindows 失败：" + ex.Message); return 1; }
                 }
                 default:
                     return 1;
@@ -157,9 +165,13 @@ namespace UpDownSplit
         private const int WS_EX_TOOLWINDOW = 0x80;
         private const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
         private const int DWMWA_CLOAKED = 14;
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct RECT { public int L; public int T; public int R; public int B; }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
 
         [StructLayout(LayoutKind.Sequential)]
         public struct MONITORINFO
@@ -195,6 +207,11 @@ namespace UpDownSplit
         public static extern int DwmGetWindowAttributeRect(IntPtr hWnd, int attr, ref RECT r, int size);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+        [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
+        [DllImport("user32.dll")] public static extern bool DestroyIcon(IntPtr hIcon);
+        [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern bool QueryFullProcessImageName(IntPtr h, uint flags, StringBuilder path, ref uint size);
 
         private static readonly IntPtr PerMonitorV2 = new IntPtr(-4);
 
@@ -217,6 +234,7 @@ namespace UpDownSplit
         public static List<WindowInfo> ListWindows()
         {
             List<WindowInfo> list = new List<WindowInfo>();
+            Dictionary<int, string> pidNames = new Dictionary<int, string>(); // pid→进程名缓存，避免重复查询
             EnumWindows(delegate(IntPtr h, IntPtr l)
             {
                 if (IsAltTabStyle(h))
@@ -225,9 +243,9 @@ namespace UpDownSplit
                     GetWindowText(h, sb, sb.Capacity);
                     uint pid;
                     GetWindowThreadProcessId(h, out pid);
-                    string pn = "";
-                    try { pn = Process.GetProcessById((int)pid).ProcessName; }
-                    catch { }
+                    int key = (int)pid;
+                    string pn;
+                    if (!pidNames.TryGetValue(key, out pn)) { pn = GetProcessName(pid); pidNames[key] = pn; }
                     WindowInfo wi = new WindowInfo();
                     wi.Handle = h;
                     wi.Title = sb.ToString();
@@ -238,6 +256,22 @@ namespace UpDownSplit
                 return true;
             }, IntPtr.Zero);
             return list;
+        }
+
+        // 直接用 OpenProcess + QueryFullProcessImageName 取进程名。
+        // 不用 Process.GetProcessById：它每次都会全表扫一遍进程，窗口多时设置窗口会明显卡顿。
+        private static string GetProcessName(uint pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, (int)pid);
+            if (h == IntPtr.Zero) return "";
+            try
+            {
+                StringBuilder sb = new StringBuilder(1024);
+                uint size = (uint)sb.Capacity;
+                if (!QueryFullProcessImageName(h, 0, sb, ref size)) return "";
+                return Path.GetFileNameWithoutExtension(sb.ToString(0, (int)size));
+            }
+            finally { CloseHandle(h); }
         }
 
         // 从 fg 往下按 Z 序找第一个"像 Alt-Tab 候选"的窗口（同显示器、可见、未最小化）
@@ -281,15 +315,73 @@ namespace UpDownSplit
         }
     }
 
+    // 极简 key=value 配置（%APPDATA%\UpDownSplit\config.txt），读不出来就当没有
+    internal static class Config
+    {
+        private static readonly string Dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "UpDownSplit");
+        private static readonly string FilePath = Path.Combine(Dir, "config.txt");
+        private static readonly Dictionary<string, string> Values = Load();
+
+        public static string Get(string key, string def)
+        {
+            string v;
+            return Values.TryGetValue(key, out v) ? v : def;
+        }
+
+        public static int GetInt(string key, int def, int min, int max)
+        {
+            int v;
+            if (!int.TryParse(Get(key, null), out v)) return def;
+            return Math.Max(min, Math.Min(max, v));
+        }
+
+        public static void Set(string key, string value) { Values[key] = value; }
+
+        public static void Save()
+        {
+            try
+            {
+                Directory.CreateDirectory(Dir);
+                string[] lines = new string[Values.Count];
+                int i = 0;
+                foreach (KeyValuePair<string, string> kv in Values)
+                    lines[i++] = kv.Key + "=" + kv.Value;
+                File.WriteAllLines(FilePath, lines, Encoding.UTF8);
+            }
+            catch { } // 配置写不进去不影响分屏功能
+        }
+
+        private static Dictionary<string, string> Load()
+        {
+            Dictionary<string, string> d = new Dictionary<string, string>();
+            try
+            {
+                if (File.Exists(FilePath))
+                    foreach (string line in File.ReadAllLines(FilePath))
+                    {
+                        int eq = line.IndexOf('=');
+                        if (eq <= 0) continue;
+                        d[line.Substring(0, eq)] = line.Substring(eq + 1);
+                    }
+            }
+            catch { }
+            return d;
+        }
+    }
+
     internal sealed class WindowMover
     {
         private readonly List<KeyValuePair<IntPtr, Native.RECT>> _undo =
             new List<KeyValuePair<IntPtr, Native.RECT>>();
 
-        public void PlaceForeground(Half half)
+        // GUI 模式开启：摆位后由 Timer 延迟复核，纠正迟到的还原动画覆盖（CLI 无消息循环，只靠同步校验）
+        public bool EnableDeferredChecks { get; set; }
+
+        public bool PlaceForeground(Half half)
         {
             IntPtr fg = Native.GetForegroundWindow();
-            if (fg != IntPtr.Zero) Place(fg, half);
+            return fg != IntPtr.Zero && Place(fg, half);
         }
 
         public bool SplitTopBottom()
@@ -305,20 +397,13 @@ namespace UpDownSplit
             return SplitWindows(fg, other);
         }
 
+        // 一键分屏：当前窗上、下一窗下。找不到下面的窗口时仍贴上面的窗口，但整体返回 false
         public bool SplitWindows(IntPtr top, IntPtr bottom)
         {
             if (top == IntPtr.Zero) return false;
-            Native.RECT wa = WorkArea(top);
-            int fullH = wa.B - wa.T;
-            int topH = fullH / 2;
-            Native.RECT zt = new Native.RECT();
-            zt.L = wa.L; zt.T = wa.T; zt.R = wa.R; zt.B = wa.T + topH;
-            Native.RECT zb = new Native.RECT();
-            zb.L = wa.L; zb.T = wa.T + topH; zb.R = wa.R; zb.B = wa.B;
-            Place(top, zt);
+            bool ok = Place(top, Half.Top);
             if (bottom == IntPtr.Zero) return false;
-            Place(bottom, zb);
-            return true;
+            return Place(bottom, Half.Bottom) && ok;
         }
 
         public void RestoreLast()
@@ -329,38 +414,41 @@ namespace UpDownSplit
                 KeyValuePair<IntPtr, Native.RECT> e = _undo[last];
                 _undo.RemoveAt(last);
                 if (!Native.IsWindow(e.Key)) continue;
-                if (Native.IsIconic(e.Key) || Native.IsZoomed(e.Key))
+                bool wasMinMax = Native.IsIconic(e.Key) || Native.IsZoomed(e.Key);
+                if (wasMinMax)
+                {
                     Native.ShowWindow(e.Key, Native.SW_RESTORE);
+                    WaitRestore(e.Key);
+                }
                 Native.SetWindowPos(e.Key, IntPtr.Zero,
                     e.Value.L, e.Value.T, e.Value.R - e.Value.L, e.Value.B - e.Value.T, 0);
+                if (wasMinMax) Settle(e.Key, e.Value, false);
                 return;
             }
         }
 
-        public void Place(IntPtr h, Half half)
+        public bool Place(IntPtr h, Half half)
         {
             Native.RECT wa = WorkArea(h);
-            int fullH = wa.B - wa.T;
-            int topH = fullH / 2;
-            Native.RECT z = new Native.RECT();
-            z.L = wa.L;
-            z.R = wa.R;
-            if (half == Half.Top) { z.T = wa.T; z.B = wa.T + topH; }
-            else { z.T = wa.T + topH; z.B = wa.B; }
-            Place(h, z);
+            Native.RECT a, b;
+            SplitRects(wa, true, 50, out a, out b);
+            return Place(h, half == Half.Top ? a : b);
         }
 
         // 通用摆位：把窗口放进指定矩形（先还原最大/最小化状态，记录 undo）
-        public void Place(IntPtr h, Native.RECT zone)
+        public bool Place(IntPtr h, Native.RECT zone)
         {
-            if (h == IntPtr.Zero || !Native.IsWindow(h)) return;
-            if (Native.IsIconic(h) || Native.IsZoomed(h))
+            if (h == IntPtr.Zero || !Native.IsWindow(h)) return false;
+            bool wasMinMax = Native.IsIconic(h) || Native.IsZoomed(h);
+            if (wasMinMax)
             {
                 Native.ShowWindow(h, Native.SW_RESTORE);
-                Thread.Sleep(30); // 等还原动画完成，避免 SetWindowPos 被覆盖
+                WaitRestore(h);
             }
             SaveUndo(h);
             SetWindowToZone(h, zone);
+            if (wasMinMax) Settle(h, zone, true);
+            return Native.IsWindow(h);
         }
 
         // Windows 10 窗口带一圈不可见的调整边框，SetWindowPos 以外框为准。
@@ -389,6 +477,38 @@ namespace UpDownSplit
             return mi.rcWork;
         }
 
+        // 由屏幕尺寸定位其显示器的工作区（设置窗口用，和摆位同一数据源，避免两套算法不一致）
+        public static Native.RECT WorkAreaAtCenter(Rectangle screen)
+        {
+            Native.POINT p = new Native.POINT();
+            p.X = screen.Left + screen.Width / 2;
+            p.Y = screen.Top + screen.Height / 2;
+            IntPtr mon = Native.MonitorFromPoint(p, Native.MONITOR_DEFAULTTONEAREST);
+            Native.MONITORINFO mi = new Native.MONITORINFO();
+            mi.cbSize = Marshal.SizeOf(typeof(Native.MONITORINFO));
+            if (Native.GetMonitorInfo(mon, ref mi)) return mi.rcWork;
+            Native.RECT fallback = new Native.RECT();
+            fallback.L = screen.Left; fallback.T = screen.Top;
+            fallback.R = screen.Right; fallback.B = screen.Bottom;
+            return fallback;
+        }
+
+        // 在工作区内按比例切出两块区域（vertical=true 上下切，ratio 为第一块的占比）
+        public static void SplitRects(Native.RECT wa, bool vertical, int ratio, out Native.RECT a, out Native.RECT b)
+        {
+            a = wa; b = wa;
+            if (vertical)
+            {
+                a.B = wa.T + (wa.B - wa.T) * ratio / 100;
+                b.T = a.B;
+            }
+            else
+            {
+                a.R = wa.L + (wa.R - wa.L) * ratio / 100;
+                b.L = a.R;
+            }
+        }
+
         private void SaveUndo(IntPtr h)
         {
             for (int i = 0; i < _undo.Count; i++)
@@ -398,6 +518,87 @@ namespace UpDownSplit
             _undo.Add(new KeyValuePair<IntPtr, Native.RECT>(h, r));
             if (_undo.Count > 30) _undo.RemoveAt(0);
         }
+
+        // ---- 摆位/还原后的落位校验：最大化/最小化的还原是异步动画，可能在我们 SetWindowPos
+        // 之后才落地并覆盖位置。只对这类窗口做有界重试（普通窗口零等待），GUI 下再补一次延迟复核 ----
+
+        private struct SettleCheck
+        {
+            public IntPtr Hwnd;
+            public Native.RECT Zone; // Compensate=true 时为期望的可见边框，否则为期望的外框
+            public bool Compensate;
+            public int Ticks;
+        }
+
+        private void Settle(IntPtr h, Native.RECT zone, bool compensate)
+        {
+            SettleCheck c = new SettleCheck();
+            c.Hwnd = h; c.Zone = zone; c.Compensate = compensate; c.Ticks = 2;
+            for (int i = 0; i < 2 && Native.IsWindow(h); i++)
+            {
+                Thread.Sleep(40);
+                if (IsSettled(c)) return;
+                Reapply(c);
+            }
+            if (EnableDeferredChecks) ScheduleRecheck(c);
+        }
+
+        private static bool IsSettled(SettleCheck c)
+        {
+            Native.RECT cur;
+            bool ok = c.Compensate ? Native.GetVisibleRect(c.Hwnd, out cur)
+                                   : Native.GetWindowRect(c.Hwnd, out cur);
+            if (!ok) return true; // 查不到就不折腾了
+            return Math.Abs(cur.L - c.Zone.L) <= 4 && Math.Abs(cur.T - c.Zone.T) <= 4
+                && Math.Abs(cur.R - c.Zone.R) <= 4 && Math.Abs(cur.B - c.Zone.B) <= 4;
+        }
+
+        private static void Reapply(SettleCheck c)
+        {
+            if (c.Compensate) SetWindowToZone(c.Hwnd, c.Zone);
+            else Native.SetWindowPos(c.Hwnd, IntPtr.Zero,
+                c.Zone.L, c.Zone.T, c.Zone.R - c.Zone.L, c.Zone.B - c.Zone.T, 0);
+        }
+
+        private static void WaitRestore(IntPtr h)
+        {
+            // ShowWindow(SW_RESTORE) 异步生效：轮询等状态切换，通常第一轮就通过
+            for (int i = 0; i < 30; i++)
+            {
+                if (!Native.IsIconic(h) && !Native.IsZoomed(h)) return;
+                Thread.Sleep(5);
+            }
+        }
+
+        private readonly List<SettleCheck> _pending = new List<SettleCheck>();
+        private System.Windows.Forms.Timer _recheckTimer;
+
+        private void ScheduleRecheck(SettleCheck c)
+        {
+            if (_recheckTimer == null)
+            {
+                _recheckTimer = new System.Windows.Forms.Timer { Interval = 150 };
+                _recheckTimer.Tick += delegate
+                {
+                    for (int i = _pending.Count - 1; i >= 0; i--)
+                    {
+                        SettleCheck p = _pending[i];
+                        if (!Native.IsWindow(p.Hwnd) || IsSettled(p)) { _pending.RemoveAt(i); continue; }
+                        Reapply(p);
+                        if (--p.Ticks <= 0) _pending.RemoveAt(i); else _pending[i] = p;
+                    }
+                    if (_pending.Count == 0) _recheckTimer.Stop();
+                };
+            }
+            _pending.Add(c);
+            _recheckTimer.Start();
+        }
+    }
+
+    // 开启双缓冲的 Panel，拖比例滑条时预览不闪烁
+    internal sealed class BufferedPanel : Panel
+    {
+        public BufferedPanel() { DoubleBuffered = true; }
     }
 
     internal sealed class ScreenCard
@@ -464,7 +665,7 @@ namespace UpDownSplit
             cardHost.Padding = new Padding(10, 6, 10, 6);
 
             // 显示器预览
-            _preview = new Panel();
+            _preview = new BufferedPanel();
             _preview.Dock = DockStyle.Top;
             _preview.Height = 210;
             _preview.BackColor = Color.White;
@@ -478,7 +679,7 @@ namespace UpDownSplit
             Button refresh = new Button();
             refresh.Text = "重新扫描窗口";
             refresh.AutoSize = true;
-            refresh.Click += delegate { RefreshWindows(); };
+            refresh.Click += delegate { Guard(RefreshWindows); };
             _winCount = new Label();
             _winCount.AutoSize = true;
             _winCount.Padding = new Padding(12, 8, 0, 0);
@@ -496,6 +697,33 @@ namespace UpDownSplit
 
             RefreshWindows();
             UpdateRatioUi();
+
+            // 关窗时记住每块屏的布局和比例，下次打开自动填入
+            FormClosed += delegate
+            {
+                foreach (ScreenCard c in _cards)
+                {
+                    Config.Set(MonitorKey(c.Screen) + "|layout", c.Layout.SelectedIndex.ToString());
+                    Config.Set(MonitorKey(c.Screen) + "|ratio", c.Ratio.Value.ToString());
+                }
+                Config.Save();
+            };
+        }
+
+        // 操作兜底：用户点的按钮不能让程序崩掉
+        private void Guard(Action a)
+        {
+            try { a(); }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "操作失败：" + ex.Message, "分屏设置",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private static string MonitorKey(Screen s)
+        {
+            return "m|" + s.DeviceName + "|" + s.Bounds.Width + "x" + s.Bounds.Height;
         }
 
         private Control BuildCard(Screen s, int idx)
@@ -528,7 +756,8 @@ namespace UpDownSplit
             layout.Items.Add("不分屏");
             layout.Items.Add("上下两分");
             layout.Items.Add("左右两分");
-            layout.SelectedIndex = portrait ? 1 : 2; // 竖屏默认上下、横屏默认左右
+            // 竖屏默认上下、横屏默认左右；有上次的记录则优先
+            layout.SelectedIndex = Config.GetInt(MonitorKey(s) + "|layout", portrait ? 1 : 2, 0, 2);
             layout.SelectedIndexChanged += delegate { UpdateRatioUi(); _preview.Invalidate(); };
             card.Controls.Add(layout);
 
@@ -541,9 +770,9 @@ namespace UpDownSplit
             TrackBar ratio = new TrackBar();
             ratio.Location = new Point(95, 72);
             ratio.Width = 190;
-            ratio.Minimum = 30;
-            ratio.Maximum = 70;
-            ratio.Value = 50;
+            ratio.Minimum = 20;
+            ratio.Maximum = 80;
+            ratio.Value = Config.GetInt(MonitorKey(s) + "|ratio", 50, 20, 80); // 记住上次比例
             ratio.TickFrequency = 5;
             ratio.ValueChanged += delegate { UpdateRatioUi(); _preview.Invalidate(); };
             card.Controls.Add(ratio);
@@ -651,31 +880,27 @@ namespace UpDownSplit
             }
         }
 
+        private sealed class Placement
+        {
+            public IntPtr Hwnd;
+            public Native.RECT Rect;
+            public string Title;
+        }
+
         private void Apply()
         {
             try
             {
-                List<KeyValuePair<IntPtr, Native.RECT>> plan =
-                    new List<KeyValuePair<IntPtr, Native.RECT>>();
+                List<Placement> plan = new List<Placement>();
                 HashSet<IntPtr> seen = new HashSet<IntPtr>();
                 foreach (ScreenCard c in _cards)
                 {
                     int lay = c.Layout.SelectedIndex;
                     if (lay <= 0) continue;
-                    Rectangle wa = c.Screen.WorkingArea;
-                    int v = c.Ratio.Value;
-                    Rectangle ra, rb;
-                    if (lay == 1)
-                    {
-                        ra = new Rectangle(wa.Left, wa.Top, wa.Width, wa.Height * v / 100);
-                        rb = new Rectangle(wa.Left, wa.Top + ra.Height, wa.Width, wa.Height - ra.Height);
-                    }
-                    else
-                    {
-                        ra = new Rectangle(wa.Left, wa.Top, wa.Width * v / 100, wa.Height);
-                        rb = new Rectangle(wa.Left + ra.Width, wa.Top, wa.Width - ra.Width, wa.Height);
-                    }
-                    Rectangle[] zones = new Rectangle[] { ra, rb };
+                    Native.RECT wa = WindowMover.WorkAreaAtCenter(c.Screen.Bounds);
+                    Native.RECT ra, rb;
+                    WindowMover.SplitRects(wa, lay == 1, c.Ratio.Value, out ra, out rb);
+                    Native.RECT[] zones = new Native.RECT[] { ra, rb };
                     for (int i = 0; i < 2; i++)
                     {
                         WindowInfo wi = c.Zones[i].SelectedItem as WindowInfo;
@@ -686,10 +911,9 @@ namespace UpDownSplit
                                 "分屏设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                             return;
                         }
-                        Native.RECT z = new Native.RECT();
-                        z.L = zones[i].Left; z.T = zones[i].Top;
-                        z.R = zones[i].Right; z.B = zones[i].Bottom;
-                        plan.Add(new KeyValuePair<IntPtr, Native.RECT>(wi.Handle, z));
+                        Placement p = new Placement();
+                        p.Hwnd = wi.Handle; p.Rect = zones[i]; p.Title = wi.Title;
+                        plan.Add(p);
                     }
                 }
                 if (plan.Count == 0)
@@ -698,10 +922,21 @@ namespace UpDownSplit
                         "分屏设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return;
                 }
-                foreach (KeyValuePair<IntPtr, Native.RECT> p in plan)
-                    _mover.Place(p.Key, p.Value);
-                MessageBox.Show(this, "分屏完成！共摆放 " + plan.Count + " 个窗口。",
-                    "分屏设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                int placed = 0;
+                List<string> skipped = new List<string>();
+                foreach (Placement p in plan)
+                {
+                    if (_mover.Place(p.Hwnd, p.Rect)) placed++;
+                    else skipped.Add(p.Title); // 扫描之后窗口已被关闭等
+                }
+                if (skipped.Count == 0)
+                    MessageBox.Show(this, "分屏完成！共摆放 " + placed + " 个窗口。",
+                        "分屏设置", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                else
+                    MessageBox.Show(this,
+                        "已摆放 " + placed + "/" + plan.Count + " 个窗口，以下窗口无法摆放（可能已关闭）：\n"
+                        + string.Join("\n", skipped.ToArray()),
+                        "分屏设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 Close();
             }
             catch (Exception ex)
@@ -754,10 +989,10 @@ namespace UpDownSplit
                     int lay = c.Layout.SelectedIndex;
                     if (lay > 0)
                     {
-                        Rectangle wa = c.Screen.WorkingArea;
+                        Native.RECT wa = WindowMover.WorkAreaAtCenter(b);
                         RectangleF wdest = new RectangleF(
-                            (wa.Left - minL) * scale + ox, (wa.Top - minT) * scale + oy,
-                            wa.Width * scale, wa.Height * scale);
+                            (wa.L - minL) * scale + ox, (wa.T - minT) * scale + oy,
+                            (wa.R - wa.L) * scale, (wa.B - wa.T) * scale);
                         float v = c.Ratio.Value / 100f;
                         if (lay == 1)
                         {
@@ -778,14 +1013,19 @@ namespace UpDownSplit
             }
         }
 
-        private void DrawZoneNumber(Graphics g, float x, float y, string n)
+        private static readonly Font ZoneNumberFont = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold);
+        private static readonly Brush ZoneNumberBrush = new SolidBrush(Color.FromArgb(90, 90, 90));
+
+        private static void DrawZoneNumber(Graphics g, float x, float y, string n)
         {
-            using (Font f = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold))
-            using (Brush br = new SolidBrush(Color.FromArgb(90, 90, 90)))
-            {
-                SizeF sz = g.MeasureString(n, f);
-                g.DrawString(n, f, br, x - sz.Width / 2, y - sz.Height / 2);
-            }
+            SizeF sz = g.MeasureString(n, ZoneNumberFont);
+            g.DrawString(n, ZoneNumberFont, ZoneNumberBrush, x - sz.Width / 2, y - sz.Height / 2);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && _small != null) _small.Dispose();
+            base.Dispose(disposing);
         }
     }
 
@@ -798,17 +1038,23 @@ namespace UpDownSplit
 
         private readonly WindowMover _mover = new WindowMover();
         private NotifyIcon _tray;
+        private Icon _icon;
         private HotkeyWindow _hotkeys;
         private ToolStripMenuItem _autoStartItem;
+        private bool _disposed;
 
         public TrayApp()
         {
+            _mover.EnableDeferredChecks = true; // GUI 下摆位后做延迟复核
+
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add(new ToolStripMenuItem("分屏设置...", null, delegate { Safe(OpenSettings); }));
             menu.Items.Add(new ToolStripMenuItem("一键上下分屏  Win+Ctrl+S", null,
-                delegate { Safe(delegate { _mover.SplitTopBottom(); }); }));
+                delegate { Safe(SplitAndNotify); }));
             menu.Items.Add(new ToolStripMenuItem("还原上次移动  Win+Ctrl+R", null,
                 delegate { Safe(delegate { _mover.RestoreLast(); }); }));
+            menu.Items.Add(new ToolStripMenuItem("重新注册快捷键", null,
+                delegate { Safe(RegisterHotkeysAndNotify); }));
             menu.Items.Add(new ToolStripSeparator());
             _autoStartItem = new ToolStripMenuItem("开机自动启动", null,
                 delegate { Safe(ToggleAutoStart); });
@@ -817,7 +1063,8 @@ namespace UpDownSplit
             menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitApp(); }));
 
             _tray = new NotifyIcon();
-            _tray.Icon = MakeIcon();
+            _icon = MakeIcon();
+            _tray.Icon = _icon;
             _tray.Text = "上下分屏助手";
             _tray.ContextMenuStrip = menu;
             _tray.Visible = true;
@@ -826,26 +1073,58 @@ namespace UpDownSplit
             _autoStartItem.Checked = AutoStartEnabled();
 
             _hotkeys = new HotkeyWindow(OnHotkey);
-            int mods = Native.MOD_WIN | Native.MOD_CONTROL | Native.MOD_NOREPEAT;
-            List<string> failed = new List<string>();
-            if (!Native.RegisterHotKey(_hotkeys.Handle, HK_TOP, mods, VK_UP)) failed.Add("Win+Ctrl+↑");
-            if (!Native.RegisterHotKey(_hotkeys.Handle, HK_BOTTOM, mods, VK_DOWN)) failed.Add("Win+Ctrl+↓");
-            if (!Native.RegisterHotKey(_hotkeys.Handle, HK_SPLIT, mods, VK_S)) failed.Add("Win+Ctrl+S");
-            if (!Native.RegisterHotKey(_hotkeys.Handle, HK_RESTORE, mods, VK_R)) failed.Add("Win+Ctrl+R");
-
-            if (failed.Count > 0)
+            string failed = RegisterHotkeys();
+            if (failed != null)
             {
                 _tray.ShowBalloonTip(8000, "上下分屏助手",
-                    "以下快捷键被其他软件占用，注册失败：\n" + string.Join("、", failed.ToArray()),
+                    "以下快捷键被其他软件占用，注册失败（释放后可在托盘菜单点“重新注册快捷键”）：\n" + failed,
                     ToolTipIcon.Warning);
             }
-            else
+            else if (Config.GetInt("tipShown", 0, 0, 1) == 0) // 使用说明只在第一次启动时弹
             {
+                Config.Set("tipShown", "1");
+                Config.Save();
                 _tray.ShowBalloonTip(8000, "上下分屏助手已启动",
                     "双击托盘图标打开“分屏设置”\n" +
                     "快捷键：Win+Ctrl+↑/↓ 贴上、下半屏；Win+Ctrl+S 一键分屏；Win+Ctrl+R 还原",
                     ToolTipIcon.Info);
             }
+        }
+
+        // 注册全部快捷键；有占用时返回占用清单，全部成功返回 null
+        private string RegisterHotkeys()
+        {
+            int mods = Native.MOD_WIN | Native.MOD_CONTROL | Native.MOD_NOREPEAT;
+            List<string> failed = new List<string>();
+            if (!RegHotkey(HK_TOP, mods, VK_UP)) failed.Add("Win+Ctrl+↑");
+            if (!RegHotkey(HK_BOTTOM, mods, VK_DOWN)) failed.Add("Win+Ctrl+↓");
+            if (!RegHotkey(HK_SPLIT, mods, VK_S)) failed.Add("Win+Ctrl+S");
+            if (!RegHotkey(HK_RESTORE, mods, VK_R)) failed.Add("Win+Ctrl+R");
+            return failed.Count == 0 ? null : string.Join("、", failed.ToArray());
+        }
+
+        private bool RegHotkey(int id, int mods, int vk)
+        {
+            Native.UnregisterHotKey(_hotkeys.Handle, id); // 重试前先清掉旧的注册
+            return Native.RegisterHotKey(_hotkeys.Handle, id, mods, vk);
+        }
+
+        private void RegisterHotkeysAndNotify()
+        {
+            string failed = RegisterHotkeys();
+            if (failed != null)
+                _tray.ShowBalloonTip(8000, "上下分屏助手",
+                    "以下快捷键仍被其他软件占用：\n" + failed, ToolTipIcon.Warning);
+            else
+                _tray.ShowBalloonTip(3000, "上下分屏助手", "快捷键注册成功。", ToolTipIcon.Info);
+        }
+
+        // 一键分屏：找不到下半屏窗口时给个提示，而不是静默半成功
+        private void SplitAndNotify()
+        {
+            if (_mover.SplitTopBottom()) return;
+            _tray.ShowBalloonTip(3000, "上下分屏助手",
+                "已将当前窗口贴到上半屏；同屏没有找到可以放到下半屏的窗口。", ToolTipIcon.Info);
         }
 
         private void OpenSettings()
@@ -863,7 +1142,7 @@ namespace UpDownSplit
         {
             if (id == HK_TOP) Safe(delegate { _mover.PlaceForeground(Half.Top); });
             else if (id == HK_BOTTOM) Safe(delegate { _mover.PlaceForeground(Half.Bottom); });
-            else if (id == HK_SPLIT) Safe(delegate { _mover.SplitTopBottom(); });
+            else if (id == HK_SPLIT) Safe(SplitAndNotify);
             else if (id == HK_RESTORE) Safe(delegate { _mover.RestoreLast(); });
         }
 
@@ -884,7 +1163,13 @@ namespace UpDownSplit
         private static bool AutoStartEnabled()
         {
             using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey))
-                return k != null && k.GetValue(RunName) != null;
+            {
+                if (k == null) return false;
+                string v = k.GetValue(RunName) as string;
+                if (v == null) return false;
+                // 注册表路径必须仍指向当前 exe，exe 被移动/改名后视为失效
+                return string.Equals(v.Trim('"'), ExePath, StringComparison.OrdinalIgnoreCase);
+            }
         }
 
         private void ToggleAutoStart()
@@ -899,29 +1184,52 @@ namespace UpDownSplit
 
         private void ExitApp()
         {
-            Native.UnregisterHotKey(_hotkeys.Handle, HK_TOP);
-            Native.UnregisterHotKey(_hotkeys.Handle, HK_BOTTOM);
-            Native.UnregisterHotKey(_hotkeys.Handle, HK_SPLIT);
-            Native.UnregisterHotKey(_hotkeys.Handle, HK_RESTORE);
-            _tray.Visible = false;
-            Application.Exit();
+            Application.Exit(); // 快捷键注销、托盘与图标释放统一在 Dispose 里做
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            if (disposing)
+            {
+                if (_hotkeys != null)
+                {
+                    Native.UnregisterHotKey(_hotkeys.Handle, HK_TOP);
+                    Native.UnregisterHotKey(_hotkeys.Handle, HK_BOTTOM);
+                    Native.UnregisterHotKey(_hotkeys.Handle, HK_SPLIT);
+                    Native.UnregisterHotKey(_hotkeys.Handle, HK_RESTORE);
+                    _hotkeys.ReleaseHandle();
+                }
+                if (_tray != null)
+                {
+                    _tray.Visible = false;
+                    _tray.Dispose();
+                }
+                if (_icon != null) _icon.Dispose();
+            }
+            base.Dispose(disposing);
         }
 
         private static Icon MakeIcon()
         {
             using (Bitmap bmp = new Bitmap(32, 32))
+            using (Graphics g = Graphics.FromImage(bmp))
             {
-                using (Graphics g = Graphics.FromImage(bmp))
+                g.Clear(Color.Transparent);
+                using (SolidBrush top = new SolidBrush(Color.FromArgb(64, 132, 220)),
+                                       bot = new SolidBrush(Color.FromArgb(84, 185, 116)))
                 {
-                    g.Clear(Color.Transparent);
-                    using (SolidBrush top = new SolidBrush(Color.FromArgb(64, 132, 220)),
-                                           bot = new SolidBrush(Color.FromArgb(84, 185, 116)))
-                    {
-                        g.FillRectangle(top, 2, 3, 28, 12);
-                        g.FillRectangle(bot, 2, 17, 28, 12);
-                    }
+                    g.FillRectangle(top, 2, 3, 28, 12);
+                    g.FillRectangle(bot, 2, 17, 28, 12);
                 }
-                return Icon.FromHandle(bmp.GetHicon());
+                IntPtr h = bmp.GetHicon();
+                try
+                {
+                    using (Icon temp = Icon.FromHandle(h))
+                        return (Icon)temp.Clone(); // 克隆一份自己持有，原句柄立即销毁，避免 GDI 句柄泄漏
+                }
+                finally { Native.DestroyIcon(h); }
             }
         }
     }
