@@ -155,7 +155,7 @@ namespace UpDownSplit
 
     internal static class Native
     {
-        public const int MOD_WIN = 0x8, MOD_CONTROL = 0x2, MOD_NOREPEAT = 0x4000;
+        public const int MOD_ALT = 0x1, MOD_SHIFT = 0x4, MOD_WIN = 0x8, MOD_CONTROL = 0x2, MOD_NOREPEAT = 0x4000;
         public const int WM_HOTKEY = 0x0312;
         public const int SW_RESTORE = 9;
         public const uint MONITOR_DEFAULTTONEAREST = 2;
@@ -320,7 +320,7 @@ namespace UpDownSplit
     {
         private static readonly string Dir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "UpDownSplit");
-        private static readonly string FilePath = Path.Combine(Dir, "config.txt");
+        public static readonly string FilePath = Path.Combine(Dir, "config.txt");
         private static readonly Dictionary<string, string> Values = Load();
 
         public static string Get(string key, string def)
@@ -1066,7 +1066,6 @@ namespace UpDownSplit
     internal sealed class TrayApp : ApplicationContext
     {
         private const int HK_TOP = 1, HK_BOTTOM = 2, HK_SPLIT = 3, HK_RESTORE = 4;
-        private const int VK_UP = 0x26, VK_DOWN = 0x28, VK_S = 0x53, VK_R = 0x52;
         private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
         private const string RunName = "UpDownSplit";
 
@@ -1075,18 +1074,23 @@ namespace UpDownSplit
         private Icon _icon;
         private HotkeyWindow _hotkeys;
         private ToolStripMenuItem _autoStartItem;
+        private ToolStripMenuItem _miSplit, _miRestore;
+        private List<HotkeyDef> _hk;
         private bool _disposed;
 
         public TrayApp()
         {
             _mover.EnableDeferredChecks = true; // GUI 下摆位后做延迟复核
+            _hk = HotkeyDefs(); // 先解析键位（可被配置文件覆盖），菜单文案要用
 
             ContextMenuStrip menu = new ContextMenuStrip();
             menu.Items.Add(new ToolStripMenuItem("分屏设置...", null, delegate { Safe(OpenSettings); }));
-            menu.Items.Add(new ToolStripMenuItem("一键上下分屏  Win+Ctrl+S", null,
-                delegate { Safe(SplitAndNotify); }));
-            menu.Items.Add(new ToolStripMenuItem("还原上次移动  Win+Ctrl+R", null,
-                delegate { Safe(delegate { _mover.RestoreLast(); }); }));
+            _miSplit = new ToolStripMenuItem("一键上下分屏  " + HkLabel(HK_SPLIT), null,
+                delegate { Safe(SplitAndNotify); });
+            menu.Items.Add(_miSplit);
+            _miRestore = new ToolStripMenuItem("还原上次移动  " + HkLabel(HK_RESTORE), null,
+                delegate { Safe(delegate { _mover.RestoreLast(); }); });
+            menu.Items.Add(_miRestore);
             menu.Items.Add(new ToolStripMenuItem("重新注册快捷键", null,
                 delegate { Safe(RegisterHotkeysAndNotify); }));
             menu.Items.Add(new ToolStripSeparator());
@@ -1110,8 +1114,10 @@ namespace UpDownSplit
             string failed = RegisterHotkeys();
             if (failed != null)
             {
-                _tray.ShowBalloonTip(8000, "上下分屏助手",
-                    "以下快捷键被其他软件占用，注册失败（释放后可在托盘菜单点“重新注册快捷键”）：\n" + failed,
+                _tray.ShowBalloonTip(10000, "上下分屏助手",
+                    "以下快捷键被其他软件占用：" + failed + "\n" +
+                    "可在 " + Config.FilePath + " 里修改 hk_ 开头的项换键（如 hk_split=Ctrl+Alt+S），\n" +
+                    "改后点托盘菜单“重新注册快捷键”即可生效。",
                     ToolTipIcon.Warning);
             }
             else if (Config.GetInt("tipShown", 0, 0, 1) == 0) // 使用说明只在第一次启动时弹
@@ -1125,32 +1131,149 @@ namespace UpDownSplit
             }
         }
 
+        private sealed class HotkeyDef
+        {
+            public int Id;
+            public string Label; // 展示用，如 "Win+Ctrl+↑"
+            public int Mods;
+            public int Vk;
+        }
+
+        private List<HotkeyDef> HotkeyDefs()
+        {
+            List<HotkeyDef> defs = new List<HotkeyDef>();
+            AddDef(defs, HK_TOP, "hk_top", "Win+Ctrl+↑");
+            AddDef(defs, HK_BOTTOM, "hk_bottom", "Win+Ctrl+↓");
+            AddDef(defs, HK_SPLIT, "hk_split", "Win+Ctrl+S");
+            AddDef(defs, HK_RESTORE, "hk_restore", "Win+Ctrl+R");
+            return defs;
+        }
+
+        private static void AddDef(List<HotkeyDef> defs, int id, string cfgKey, string defText)
+        {
+            int mods, vk;
+            ParseHotkey(Config.Get(cfgKey, defText), defText, out mods, out vk);
+            HotkeyDef d = new HotkeyDef();
+            d.Id = id; d.Mods = mods; d.Vk = vk; d.Label = DescribeHotkey(mods, vk);
+            defs.Add(d);
+        }
+
+        // 解析 "Win+Ctrl+S" 这类描述；解析不了回退默认。修饰键必须有（没有就补 Win+Ctrl），避免抢占普通按键
+        private static void ParseHotkey(string text, string defText, out int mods, out int vk)
+        {
+            mods = 0; vk = 0;
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                string src = attempt == 0 ? text : defText;
+                int m = 0, k = 0;
+                if (src != null)
+                    foreach (string raw in src.Split('+'))
+                    {
+                        string t = raw.Trim().ToLowerInvariant();
+                        if (t.Length == 0) continue;
+                        if (t == "win") { m |= Native.MOD_WIN; continue; }
+                        if (t == "ctrl" || t == "control") { m |= Native.MOD_CONTROL; continue; }
+                        if (t == "shift") { m |= Native.MOD_SHIFT; continue; }
+                        if (t == "alt") { m |= Native.MOD_ALT; continue; }
+                        int v = VkFromName(t);
+                        if (v != 0) k = v;
+                    }
+                if (m == 0) m = Native.MOD_WIN | Native.MOD_CONTROL;
+                if (k != 0) { mods = m; vk = k; return; }
+            }
+            mods = Native.MOD_WIN | Native.MOD_CONTROL; vk = (int)'S'; // 兜底，理论上到不了
+        }
+
+        private static int VkFromName(string t)
+        {
+            switch (t)
+            {
+                case "up": case "↑": return 0x26;
+                case "down": case "↓": return 0x28;
+                case "left": case "←": return 0x25;
+                case "right": case "→": return 0x27;
+                case "pgup": return 0x21;
+                case "pgdn": case "pagedown": return 0x22;
+                case "home": return 0x24;
+                case "end": return 0x23;
+                case "ins": case "insert": return 0x2D;
+                case "del": case "delete": return 0x2E;
+                case "space": return 0x20;
+                case "tab": return 0x09;
+                case "enter": case "return": return 0x0D;
+                case "esc": case "escape": return 0x1B;
+            }
+            if (t.Length >= 2 && t.Length <= 3 && t[0] == 'f')
+            {
+                int n;
+                if (int.TryParse(t.Substring(1), out n) && n >= 1 && n <= 24) return 0x6F + n;
+            }
+            if (t.Length == 1)
+            {
+                char c = char.ToUpperInvariant(t[0]);
+                if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')) return (int)c;
+            }
+            return 0;
+        }
+
+        private static string DescribeHotkey(int mods, int vk)
+        {
+            StringBuilder sb = new StringBuilder();
+            if ((mods & Native.MOD_WIN) != 0) sb.Append("Win+");
+            if ((mods & Native.MOD_CONTROL) != 0) sb.Append("Ctrl+");
+            if ((mods & Native.MOD_SHIFT) != 0) sb.Append("Shift+");
+            if ((mods & Native.MOD_ALT) != 0) sb.Append("Alt+");
+            sb.Append(VkName(vk));
+            return sb.ToString();
+        }
+
+        private static string VkName(int vk)
+        {
+            switch (vk)
+            {
+                case 0x25: return "←"; case 0x26: return "↑"; case 0x27: return "→"; case 0x28: return "↓";
+                case 0x21: return "PgUp"; case 0x22: return "PgDn"; case 0x23: return "End"; case 0x24: return "Home";
+                case 0x2D: return "Ins"; case 0x2E: return "Del";
+                case 0x20: return "Space"; case 0x09: return "Tab"; case 0x0D: return "Enter"; case 0x1B: return "Esc";
+            }
+            if (vk >= 0x70 && vk <= 0x87) return "F" + (vk - 0x6F);
+            if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9')) return ((char)vk).ToString();
+            return "Key" + vk.ToString("X2");
+        }
+
+        private string HkLabel(int id)
+        {
+            foreach (HotkeyDef d in _hk)
+                if (d.Id == id) return d.Label;
+            return "";
+        }
+
         // 注册全部快捷键；有占用时返回占用清单，全部成功返回 null
         private string RegisterHotkeys()
         {
-            int mods = Native.MOD_WIN | Native.MOD_CONTROL | Native.MOD_NOREPEAT;
             List<string> failed = new List<string>();
-            if (!RegHotkey(HK_TOP, mods, VK_UP)) failed.Add("Win+Ctrl+↑");
-            if (!RegHotkey(HK_BOTTOM, mods, VK_DOWN)) failed.Add("Win+Ctrl+↓");
-            if (!RegHotkey(HK_SPLIT, mods, VK_S)) failed.Add("Win+Ctrl+S");
-            if (!RegHotkey(HK_RESTORE, mods, VK_R)) failed.Add("Win+Ctrl+R");
+            foreach (HotkeyDef d in _hk)
+            {
+                Native.UnregisterHotKey(_hotkeys.Handle, d.Id); // 重试前先清掉旧的注册
+                if (!Native.RegisterHotKey(_hotkeys.Handle, d.Id, d.Mods | Native.MOD_NOREPEAT, d.Vk))
+                    failed.Add(d.Label);
+            }
             return failed.Count == 0 ? null : string.Join("、", failed.ToArray());
-        }
-
-        private bool RegHotkey(int id, int mods, int vk)
-        {
-            Native.UnregisterHotKey(_hotkeys.Handle, id); // 重试前先清掉旧的注册
-            return Native.RegisterHotKey(_hotkeys.Handle, id, mods, vk);
         }
 
         private void RegisterHotkeysAndNotify()
         {
+            _hk = HotkeyDefs(); // 重新读配置，改过键位立即生效
             string failed = RegisterHotkeys();
+            _miSplit.Text = "一键上下分屏  " + HkLabel(HK_SPLIT);
+            _miRestore.Text = "还原上次移动  " + HkLabel(HK_RESTORE);
             if (failed != null)
                 _tray.ShowBalloonTip(8000, "上下分屏助手",
                     "以下快捷键仍被其他软件占用：\n" + failed, ToolTipIcon.Warning);
             else
-                _tray.ShowBalloonTip(3000, "上下分屏助手", "快捷键注册成功。", ToolTipIcon.Info);
+                _tray.ShowBalloonTip(3000, "上下分屏助手", "快捷键注册成功：" +
+                    HkLabel(HK_TOP) + " / " + HkLabel(HK_BOTTOM) + " / " + HkLabel(HK_SPLIT) + " / " + HkLabel(HK_RESTORE),
+                    ToolTipIcon.Info);
         }
 
         // 一键分屏：找不到下半屏窗口时给个提示，而不是静默半成功
